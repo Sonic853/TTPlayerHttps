@@ -1,0 +1,3 @@
+LIBRARY ttp_https
+EXPORTS
+    ttp_https_get_api

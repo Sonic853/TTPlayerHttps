@@ -1,0 +1,110 @@
+name: Build HTTPS plugin
+run-name: HTTPS x86 Release - ${{ github.ref_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_a_version:
+        description: Release a Version (GitHub)
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+# Reserve a same-day version until publication finishes. This group is local to
+# the HTTPS repository; player and AAC workflows remain independent.
+concurrency:
+  group: ${{ inputs.release_a_version && 'manual-https-release' || format('manual-https-build-{0}', github.run_id) }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build HTTPS DLL (VS 2026, x86)
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    outputs:
+      release_version: ${{ steps.version.outputs.version }}
+      previous_version: ${{ steps.version.outputs.previous }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Allocate Beijing date version before compilation
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REQUESTED: ${{ inputs.release_a_version }}
+        run: |
+          ./cmake/resolve_release_version.ps1 -Repository $env:GITHUB_REPOSITORY `
+            -ReleaseRequested:($env:RELEASE_REQUESTED -eq 'true')
+      - name: Build size-optimized DLL and audit XP/Win7 imports
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          ./build.ps1 -PackageVersion $env:PACKAGE_VERSION
+      - name: Stage exactly the DLL and its checksum
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . ./cmake/version.ps1
+          Assert-HttpsFileVersion 'build/Release/AddIn/ttp_https.dll' $env:PACKAGE_VERSION
+          New-Item -ItemType Directory -Path artifact/AddIn | Out-Null
+          Copy-Item -LiteralPath build/Release/AddIn/ttp_https.dll -Destination artifact/AddIn/ttp_https.dll
+          Copy-Item -LiteralPath build/Release/SHA256SUMS.txt -Destination artifact/SHA256SUMS.txt
+          $hash = (Get-FileHash -LiteralPath artifact/AddIn/ttp_https.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ((Get-Content -LiteralPath artifact/SHA256SUMS.txt -Raw).Trim() -cne "$hash  AddIn/ttp_https.dll") {
+            throw 'HTTPS DLL checksum mismatch.'
+          }
+      # No sibling repositories, tests, docs, licenses or intermediate files are
+      # included. Downloading this artifact yields the same two-file layout.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ttp_https-${{ steps.version.outputs.version }}
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 14
+
+  github_release:
+    name: GitHub Release
+    needs: build
+    if: inputs.release_a_version
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RELEASE_VERSION: ${{ needs.build.outputs.release_version }}
+      PREVIOUS_VERSION: ${{ needs.build.outputs.previous_version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ttp_https-${{ needs.build.outputs.release_version }}
+          path: build/Release
+      - name: Verify DLL version and prepare the two-file ZIP
+        run: |
+          ./cmake/package.ps1 -BuildDirectory build -Version $env:RELEASE_VERSION
+          ./cmake/prepare_release.ps1 -Version $env:RELEASE_VERSION -PreviousVersion $env:PREVIOUS_VERSION `
+            -Repository $env:GITHUB_REPOSITORY -Commit $env:GITHUB_SHA -ServerUrl $env:GITHUB_SERVER_URL
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./cmake/verify_package.ps1 -Archive "build/Release/ttp_https-$env:RELEASE_VERSION.zip" `
+            -Version $env:RELEASE_VERSION -ArchiveManifest build/Release/PACKAGE_SHA256SUMS.txt
+          gh release create "$env:RELEASE_VERSION" "build/Release/ttp_https-$env:RELEASE_VERSION.zip" `
+            --repo "$env:GITHUB_REPOSITORY" --target "$env:GITHUB_SHA" `
+            --title "$env:RELEASE_VERSION" --notes-file build/Release/release-notes.md
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub publication failed; existing releases are not overwritten.' }
