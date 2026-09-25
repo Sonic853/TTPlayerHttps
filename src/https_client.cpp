@@ -306,9 +306,9 @@ int Headers(Stream& stream, std::map<std::string,std::string>& headers) {
     }
     return status;
 }
-size_t Number(std::string_view value,int base) {
+size_t Number(std::string_view value,int base,size_t limit=body_limit) {
     size_t n{}; auto parsed=std::from_chars(value.data(),value.data()+value.size(),n,base);
-    if (value.empty() || parsed.ec!=std::errc{} || parsed.ptr!=value.data()+value.size() || n>body_limit)
+    if (value.empty() || parsed.ec!=std::errc{} || parsed.ptr!=value.data()+value.size() || n>limit)
         throw std::runtime_error("Invalid or excessive HTTPS body length");
     return n;
 }
@@ -333,6 +333,41 @@ void ReadBody(Stream& stream, PortableHttpResponse& result) {
         do { stream.Take(stream.buffered.size(),result.body); } while(stream.More());
     }
 }
+void ReadDownloadBody(Stream& stream, PortableHttpResponse& result,
+                      const ttp_https_download_request& request) {
+    const auto coding=result.headers.find("content-encoding");
+    if(coding!=result.headers.end() && Lower(coding->second)!="identity")
+        throw std::runtime_error("Unexpected HTTPS content encoding");
+    const auto transfer=result.headers.find("transfer-encoding"), length=result.headers.find("content-length");
+    const auto limit=static_cast<size_t>(request.max_size);
+    const uint64_t total=length==result.headers.end() ? 0 : Number(length->second,10,limit);
+    uint64_t received=0;
+    auto take=[&](size_t n) {
+        if(n>request.max_size-received) throw std::runtime_error("HTTPS download exceeds limit");
+        while(n) {
+            stream.guard();
+            if(stream.buffered.empty() && !stream.More()) throw std::runtime_error("Truncated HTTPS body");
+            const size_t count=std::min(n,stream.buffered.size());
+            if(!request.write(request.write_context,
+                reinterpret_cast<const unsigned char*>(stream.buffered.data()),count,received+count,total))
+                throw std::runtime_error("HTTPS download write failed");
+            received+=count; stream.buffered.erase(0,count); n-=count;
+        }
+    };
+    if(transfer!=result.headers.end()) {
+        if(length!=result.headers.end() || Lower(transfer->second)!="chunked")
+            throw std::runtime_error("Ambiguous HTTPS body framing");
+        for(;;) {
+            const auto line=stream.Line();
+            const auto n=Number(std::string_view(line).substr(0,line.find(';')),16,limit);
+            if(!n) { while(!stream.Line().empty()) {} break; }
+            take(n);
+            std::string ending;stream.Take(2,ending);
+            if(ending!="\r\n") throw std::runtime_error("Invalid HTTPS chunk terminator");
+        }
+    } else if(length!=result.headers.end()) take(static_cast<size_t>(total));
+    else do { take(stream.buffered.size()); } while(stream.More());
+}
 #include "https_proxy.inl"
 std::wstring Redirect(const std::wstring& base,const Url& target,const std::string& location) {
     auto value=Utf8ToWide(location);
@@ -348,9 +383,12 @@ std::wstring Redirect(const std::wstring& base,const Url& target,const std::stri
 }
 }
 std::optional<PortableHttpResponse> FetchPortableHttps(const std::wstring& address,
-    const ttp_https_request& network,const std::function<bool()>& canceled) {
+    const ttp_https_request& network,const std::function<bool()>& canceled,
+    const ttp_https_download_request* download) {
     const auto* tls_api=mtm_get_api(MTM_ABI_VERSION);
-    Guard guard{canceled}; guard();
+    Guard guard{canceled};
+    if(download) guard.deadline=Clock::now()+std::chrono::minutes(10);
+    guard();
     WSADATA data{};
     if(WSAStartup(MAKEWORD(2,2),&data)) throw std::runtime_error("Cannot initialize HTTPS sockets");
     struct Cleanup { ~Cleanup(){WSACleanup();} } cleanup;
@@ -388,7 +426,8 @@ std::optional<PortableHttpResponse> FetchPortableHttps(const std::wstring& addre
             address_now=Redirect(address_now,url,location->second); continue;
         }
         if(status!=200) throw std::runtime_error("HTTP status "+std::to_string(status));
-        ReadBody(stream,result);
+        if(download) ReadDownloadBody(stream,result,*download);
+        else ReadBody(stream,result);
         guard(); return result;
     }
     throw std::runtime_error("Too many HTTPS redirects");
@@ -455,6 +494,23 @@ int __cdecl GetLegacy(const ttp_https_request* request,ttp_https_response* respo
     }
     return Get(&upgraded,response,error,error_size);
 }
+int __cdecl Download(const ttp_https_download_request* value,char* error,size_t error_size) noexcept {
+    CopyError("",error,error_size);
+    if(!value || value->size!=sizeof(*value) || !value->write ||
+        !value->max_size || value->max_size>256ULL*1024*1024 ||
+        value->request.size!=sizeof(ttp_https_request) || !value->request.url ||
+        value->request.proxy_type<0 || value->request.proxy_port<0 || value->request.proxy_port>65535) {
+        CopyError("Invalid HTTPS download request",error,error_size);return TTP_HTTPS_ERROR;
+    }
+    try {
+        const auto& r=value->request;
+        std::function<bool()> canceled=[&]{return r.canceled && r.canceled(r.cancel_context)!=0;};
+        return FetchPortableHttps(r.url,r,canceled,value) ? TTP_HTTPS_OK : TTP_HTTPS_USE_WINHTTP;
+    } catch(const Canceled&) { CopyError("Canceled",error,error_size);return TTP_HTTPS_CANCELED;
+    } catch(const std::exception& e) { CopyError(e.what(),error,error_size);
+    } catch(...) { CopyError("HTTPS download failed",error,error_size); }
+    return TTP_HTTPS_ERROR;
+}
 }
 }
 extern "C" const ttp_https_api* __cdecl ttp_https_get_api(uint32_t version) {
@@ -464,5 +520,8 @@ extern "C" const ttp_https_api* __cdecl ttp_https_get_api(uint32_t version) {
         MBEDTLS_VERSION_STRING_FULL " / " TF_PSA_CRYPTO_VERSION_STRING_FULL,
         "Mozilla/curl 2026-08-13",ttp::https::Get,ttp::https::Release};
     static constexpr ttp_https_api legacy={sizeof(ttp_https_api),1,api.library_version,api.ca_bundle_version,ttp::https::GetLegacy,ttp::https::Release};
-    return version==TTP_HTTPS_ABI_VERSION ? &api : version==1 ? &legacy : nullptr;
+    static constexpr ttp_https_api_v3 streaming={{sizeof(ttp_https_api_v3),TTP_HTTPS_DOWNLOAD_ABI_VERSION,
+        api.library_version,api.ca_bundle_version,ttp::https::Get,ttp::https::Release},ttp::https::Download};
+    return version==TTP_HTTPS_DOWNLOAD_ABI_VERSION ? &streaming.base :
+        version==TTP_HTTPS_ABI_VERSION ? &api : version==1 ? &legacy : nullptr;
 }

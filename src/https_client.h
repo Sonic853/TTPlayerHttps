@@ -13,5 +13,6 @@ struct PortableHttpResponse {
     mtm_info info{};
 };
 std::optional<PortableHttpResponse> FetchPortableHttps(const std::wstring&,
-    const ttp_https_request&,const std::function<bool()>&);
+    const ttp_https_request&,const std::function<bool()>&,
+    const ttp_https_download_request* download = nullptr);
 }

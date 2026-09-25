@@ -51,12 +51,13 @@ HTTP 明文歌词服务和原歌词插件自己的网络实现不变。
 Release 使用 `/O1 /Os /Gy /Gw`、`/GL /LTCG`、`/OPT:REF /OPT:ICF`。
 只编入 TLS 1.2／1.3 客户端、所需密码算法及 X.509；不编入 TLS 服务器、DTLS、PSK、0-RTT 或上游程序。
 121 个 Mozilla 根证书转为 DER 内嵌，PSA 密钥存储按需增长。
-当前 DLL 为 **420,352 字节（410.5 KiB）**，包含完整 HTTPS 传输及 HTTP/SOCKS 代理支持。
+当前 DLL 为 **423,424 字节（413.5 KiB）**，包含完整 HTTPS 传输、HTTP/SOCKS 代理及流式下载支持。
 原 331 KiB 的 mbed_tls_min.dll 仅包含 TLS 层。
 
 ## C ABI
 
 公开头文件 `include/ttp_https.h`，唯一导出 `ttp_https_get_api`；当前请求版本为 `2`，同时保留版本 `1` 的旧调用布局。
+更新器还可查询版本 `3`，获得向后兼容的流式 `download()` 扩展；先核对 `abi_version` 与 `size`，再转换为 `ttp_https_api_v3`。请求指定最大字节数和写入回调，回调同步执行，可报告已接收字节数与总长度（未知长度为 0）。下载接口上限 256 MiB、期限 10 分钟，播放器更新包另限制为 64 MiB；不会改变歌词 `get()` 的 2 MiB 上限。
 底层 mtm_get_api 仅供 DLL 内部调用，不再导出。
 
 1. 请求结构清零，填写 size、HTTPS URL、代理信息和取消回调。
